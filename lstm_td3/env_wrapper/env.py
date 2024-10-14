@@ -2,7 +2,11 @@ from copy import copy
 import gym
 import numpy as np
 from gym.wrappers.time_limit import TimeLimit
+
+from lstm_td3.env_wrapper.dm_control_wrapper import DeepMindControl, DMCEnv
 from lstm_td3.env_wrapper.pomdp_wrapper import POMDPWrapper
+from lstm_td3.env_wrapper.observation_wrappers import TimestepWrapper
+from lstm_td3.env_wrapper.action_wrappers import ActionClip, NormalizeActions
 
 
 class TransparentWrapper(gym.Wrapper):
@@ -295,6 +299,12 @@ def make_bullet_task(env_id, dp_type='MDP',
         raise ValueError("")
     env = BulletViewer(env=env, fps=fps, render_width=render_width, render_height=render_height)
     return env
+
+def make_dmc_manipulator(env: DeepMindControl=None, use_relative_timestep=False, seed=None):
+    if env is None:
+        # env = DeepMindControl("reacher_easy", 2, seed=seed)
+        env = DMCEnv("reacher", "easy", from_pixels=False, frame_skip=2, task_kwargs={"random":seed})
+    return NormalizeActions(env)
 
 
 # def bullet_cheetah():

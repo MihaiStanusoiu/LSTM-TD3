@@ -15,7 +15,10 @@ setup(
         'numpy',
         'pybullet',
         'torch',
-        'pandas'
+        'pandas',
+        'gymnasium',
+        'dm_control',
+        'tensorboard',
     ],
     description="Long-Short-Term-Memory-based Twine Delayed Deep Deterministic Policy Gradient (LSTM-TD3)",
     author="Lingheng Meng",

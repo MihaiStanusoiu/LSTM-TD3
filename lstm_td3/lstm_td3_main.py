@@ -6,10 +6,10 @@ import time
 import torch
 import torch.nn as nn
 from torch.optim import Adam
-from lstm_td3.utils.logx import EpochLogger, setup_logger_kwargs, colorize
+from lstm_td3.utils.logx import EpochLogger, setup_logger_kwargs, colorize, TensorBoardLogger
 import itertools
 from lstm_td3.env_wrapper.pomdp_wrapper import POMDPWrapper
-from lstm_td3.env_wrapper.env import make_bullet_task
+from lstm_td3.env_wrapper.env import make_bullet_task, make_dmc_manipulator
 import os
 import os.path as osp
 import json
@@ -475,24 +475,28 @@ def lstm_td3(resume_exp_dir=None,
     """
     # If not going to resume, create new logger.
     if resume_exp_dir is None:
-        logger = EpochLogger(**logger_kwargs)
+        logger = TensorBoardLogger(**logger_kwargs)
         logger.save_config(locals())
     else:
-        logger = EpochLogger(**logger_kwargs)
+        logger = TensorBoardLogger(**logger_kwargs)
 
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    # Wrapper environment if using POMDP
-    if partially_observable:
-        env = POMDPWrapper(env_name, pomdp_type, flicker_prob, random_noise_sigma, random_sensor_missing_prob)
-        test_env = POMDPWrapper(env_name, pomdp_type, flicker_prob, random_noise_sigma, random_sensor_missing_prob)
+    if env_name.startswith("DMC"):
+        env = make_dmc_manipulator(seed=seed)
+        test_env = make_dmc_manipulator(seed=seed)
     else:
-        # env, test_env = gym.make(env_name), gym.make(env_name)
-        env = make_bullet_task(env_name, dp_type='MDP')
-        test_env = make_bullet_task(env_name, dp_type='MDP')
-        env.seed(seed)
-        test_env.seed(seed)
+        # Wrapper environment if using POMDP
+        if partially_observable:
+            env = POMDPWrapper(env_name, pomdp_type, flicker_prob, random_noise_sigma, random_sensor_missing_prob)
+            test_env = POMDPWrapper(env_name, pomdp_type, flicker_prob, random_noise_sigma, random_sensor_missing_prob)
+        else:
+            # env, test_env = gym.make(env_name), gym.make(env_name)
+            env = make_bullet_task(env_name, dp_type='MDP')
+            test_env = make_bullet_task(env_name, dp_type='MDP')
+            env.seed(seed)
+            test_env.seed(seed)
 
     obs_dim = env.observation_space.shape[0]
     act_dim = env.action_space.shape[0]
@@ -662,7 +666,7 @@ def lstm_td3(resume_exp_dir=None,
                 o2, r, d, _ = test_env.step(a)
 
                 ep_ret += r
-                ep_len += 1
+                ep_len += test_env.action_repeat
                 # Add short history
                 if max_hist_len != 0:
                     if o_buff_len == max_hist_len:
@@ -743,7 +747,7 @@ def lstm_td3(resume_exp_dir=None,
         o2, r, d, _ = env.step(a)
 
         ep_ret += r
-        ep_len += 1
+        ep_len += env.action_repeat
 
         # Ignore the "done" signal if it comes from hitting the time
         # horizon (that is, when it's an artificial terminal signal
@@ -831,21 +835,21 @@ def lstm_td3(resume_exp_dir=None,
             test_agent()
 
             # Log info about epoch
-            logger.log_tabular('Epoch', epoch)
-            logger.log_tabular('EpRet', with_min_and_max=True)
-            logger.log_tabular('TestEpRet', with_min_and_max=True)
-            logger.log_tabular('EpLen', average_only=True)
-            logger.log_tabular('TestEpLen', average_only=True)
-            logger.log_tabular('TotalEnvInteracts', t)
-            logger.log_tabular('Q1Vals', with_min_and_max=True)
-            logger.log_tabular('Q2Vals', with_min_and_max=True)
-            logger.log_tabular('Q1ExtractedMemory', with_min_and_max=True)
-            logger.log_tabular('Q2ExtractedMemory', with_min_and_max=True)
-            logger.log_tabular('ActExtractedMemory', with_min_and_max=True)
-            logger.log_tabular('LossPi', average_only=True)
-            logger.log_tabular('LossQ', average_only=True)
+            logger.log_tabular('scalars/Epoch', epoch, timestep=epoch)
+            logger.log_tabular('scalars/EpRet', with_min_and_max=True, timestep=epoch)
+            logger.log_tabular('scalars/TestEpRet', with_min_and_max=True, timestep=epoch)
+            logger.log_tabular('scalars/EpLen', average_only=True, timestep=epoch)
+            logger.log_tabular('scalars/TestEpLen', average_only=True, timestep=epoch)
+            logger.log_tabular('scalars/TotalEnvInteracts', t, timestep=epoch)
+            logger.log_tabular('scalars/Q1Vals', with_min_and_max=True, timestep=epoch)
+            logger.log_tabular('scalars/Q2Vals', with_min_and_max=True, timestep=epoch)
+            logger.log_tabular('scalars/Q1ExtractedMemory', with_min_and_max=True, timestep=epoch)
+            logger.log_tabular('scalars/Q2ExtractedMemory', with_min_and_max=True, timestep=epoch)
+            logger.log_tabular('scalars/ActExtractedMemory', with_min_and_max=True, timestep=epoch)
+            logger.log_tabular('scalars/LossPi', average_only=True, timestep=epoch)
+            logger.log_tabular('scalars/LossQ', average_only=True, timestep=epoch)
 
-            logger.log_tabular('Time', time.time() - start_time)
+            logger.log_tabular('scalars/Time', time.time() - start_time, timestep=epoch)
             logger.dump_tabular()
 
 
@@ -918,7 +922,7 @@ if __name__ == '__main__':
         #         osp.dirname('/scratch/lingheng/'),
         #         args.data_dir)
         data_dir = osp.join(
-            osp.dirname('F:/scratch/lingheng/'),
+            osp.dirname('logdir/'),
             args.data_dir)
         logger_kwargs = setup_logger_kwargs(args.exp_name, args.seed, data_dir, datestamp=True)
     else:

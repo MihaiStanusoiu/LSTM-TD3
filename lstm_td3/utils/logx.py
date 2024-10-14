@@ -14,6 +14,9 @@ import pandas as pd
 import torch
 import os.path as osp, time, atexit, os
 import warnings
+
+from torch.utils.tensorboard import SummaryWriter
+
 from lstm_td3.utils.tools import statistics_scalar
 from lstm_td3.utils.serialization_utils import convert_json
 from lstm_td3.user_config import DEFAULT_DATA_DIR, FORCE_DATESTAMP
@@ -479,3 +482,62 @@ class EpochLogger(Logger):
         v = self.epoch_dict[key]
         vals = np.concatenate(v) if isinstance(v[0], np.ndarray) and len(v[0].shape)>0 else v
         return statistics_scalar(vals)
+
+class TensorBoardLogger(Logger):
+    def __init__(self, output_dir=None, output_fname='progress.txt', exp_name=None):
+        super().__init__(output_dir, output_fname, exp_name)
+        self.writer = SummaryWriter(log_dir=self.output_dir)
+        self.epoch_dict = dict()
+
+    def log_tabular(self, key, val=None, timestep=None, with_min_and_max=False, average_only=False):
+        if val is not None:
+            super().log_tabular(key, val)
+            if timestep is not None:
+                self.writer.add_scalar(key, val, timestep)
+            else:
+                self.writer.add_scalar(key, val)
+        else:
+            v = self.epoch_dict[key]
+            vals = np.concatenate(v) if isinstance(v[0], np.ndarray) and len(v[0].shape) > 0 else v
+            stats = statistics_scalar(vals, with_min_and_max=with_min_and_max)
+            super().log_tabular(key if average_only else 'Average' + key, stats[0])
+            if timestep is not None:
+                self.writer.add_scalar(key if average_only else 'Average' + key, stats[0], timestep)
+            else:
+                self.writer.add_scalar(key if average_only else 'Average' + key, stats[0])
+            if not average_only:
+                super().log_tabular('Std' + key, stats[1])
+                if timestep is not None:
+                    self.writer.add_scalar('Std' + key, stats[1], timestep)
+                else:
+                    self.writer.add_scalar('Std' + key, stats[1])
+            if with_min_and_max:
+                super().log_tabular('Max' + key, stats[3])
+                if timestep is not None:
+                    self.writer.add_scalar('Max' + key, stats[3], timestep)
+                else:
+                    self.writer.add_scalar('Max' + key, stats[3])
+                super().log_tabular('Min' + key, stats[2])
+                if timestep is not None:
+                    self.writer.add_scalar('Min' + key, stats[2], timestep)
+                else:
+                    self.writer.add_scalar('Min' + key, stats[2])
+        self.epoch_dict[key] = []
+
+    def store(self, **kwargs):
+        for k, v in kwargs.items():
+            if k not in self.epoch_dict:
+                self.epoch_dict['scalars/' + k] = []
+            self.epoch_dict['scalars/' + k].append(v)
+
+    def get_stats(self, key):
+        v = self.epoch_dict[key]
+        vals = np.concatenate(v) if isinstance(v[0], np.ndarray) and len(v[0].shape) > 0 else v
+        return statistics_scalar(vals)
+
+    def dump_tabular(self):
+        super().dump_tabular()
+        self.writer.flush()
+
+    def close(self):
+        self.writer.close()
