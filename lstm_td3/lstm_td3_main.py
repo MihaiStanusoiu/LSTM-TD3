@@ -8,6 +8,8 @@ import time
 import torch
 import torch.nn as nn
 from torch.optim import Adam
+
+from lstm_td3.test.test_envs import make_test_env_pi
 from lstm_td3.utils.logx import EpochLogger, setup_logger_kwargs, colorize, TensorBoardLogger
 import itertools
 from lstm_td3.env_wrapper.pomdp_wrapper import POMDPWrapper
@@ -281,19 +283,28 @@ class MLPActor(nn.Module):
                 self.mem_after_lstm_layers += [nn.Linear(self.mem_after_lstm_layer_size[h],
                                                          self.mem_after_lstm_layer_size[h + 1]),
                                                nn.ReLU()]
-        else:
+        elif rnn_cell_type == SequenceCellType.LTC.value:
             #    Pre-LTC NPC
             mem_pre_lstm_layer_size = [obs_dim] + list(mem_pre_lstm_hid_sizes)
             for h in range(len(mem_pre_lstm_layer_size) - 1):
                 self.mem_pre_lstm_layers += [nn.Linear(mem_pre_lstm_layer_size[h],
                                                        mem_pre_lstm_layer_size[h + 1]),
                                              nn.ReLU()]
-            input_size = mem_pre_lstm_layer_size[-1]
+            # input_size = mem_pre_lstm_layer_size[-1]
+            input_size = obs_dim
             wiring = ncps.wirings.AutoNCP(mem_lstm_hid_sizes[0], act_dim)
             self.rnn = CfC(input_size, wiring, batch_first=True, return_sequences=True)
             # self.rnn = CfC(input_size, mem_lstm_hid_sizes[0], batch_first=True,
             #                backbone_layers=list(mem_pre_lstm_hid_sizes).__len__(),
             #                backbone_units=mem_pre_lstm_hid_sizes[0])
+            self.mem_after_lstm_layer_size = [mem_lstm_hid_sizes[0]]
+        else:
+            input_size = obs_dim
+            if hist_with_past_act:
+                input_size += act_dim
+            self.rnn = CfC(input_size, mem_lstm_hid_sizes[0], batch_first=True,
+                           backbone_layers=list(mem_pre_lstm_hid_sizes).__len__(),
+                           backbone_units=mem_pre_lstm_hid_sizes[0])
             self.mem_after_lstm_layer_size = [mem_lstm_hid_sizes[0]]
 
         # Current Feature Extraction
@@ -319,7 +330,15 @@ class MLPActor(nn.Module):
         else:
             x = hist_obs
         # Memory
-        if self.rnn_cell_type == SequenceCellType.LSTM.value:
+        if self.rnn_cell_type == SequenceCellType.LTC.value:
+            # for layer in self.mem_pre_lstm_layers:
+            #     x = layer(x)
+            x = obs
+            x, h = self.rnn(x)
+            return self.act_limit * x, h
+        elif self.rnn_cell_type == SequenceCellType.CFC.value:
+            x, _ = self.rnn(x)
+        else:
             #    Pre-LSTM
             for layer in self.mem_pre_lstm_layers:
                 x = layer(x)
@@ -329,12 +348,6 @@ class MLPActor(nn.Module):
             #    After-LSTM
             for layer in self.mem_after_lstm_layers:
                 x = layer(x)
-        else:
-            x = obs
-            for layer in self.mem_pre_lstm_layers:
-                x = layer(x)
-            x, h = self.rnn(x)
-            return x, h
 
         hist_out = torch.gather(x, 1,
                                 (tmp_hist_seg_len - 1).view(-1, 1).repeat(1, self.mem_after_lstm_layer_size[-1]).unsqueeze(
@@ -540,8 +553,13 @@ def lstm_td3(resume_exp_dir=None,
     np.random.seed(seed)
 
     if env_name.startswith("DMC"):
-        env = make_dmc_manipulator(seed=seed)
-        test_env = make_dmc_manipulator(seed=seed)
+        env_name_no_domain = env_name.removeprefix("DMC_")
+        task, variant = env_name_no_domain.split("_", 1)
+        env = make_dmc_manipulator(task, variant, seed=seed)
+        test_env = make_dmc_manipulator(task, variant, seed=seed)
+    elif env_name.startswith("test"):
+        env = make_test_env_pi()
+        test_env = make_test_env_pi()
     else:
         # Wrapper environment if using POMDP
         if partially_observable:
@@ -722,7 +740,10 @@ def lstm_td3(resume_exp_dir=None,
                 o2, r, d, _ = test_env.step(a)
 
                 ep_ret += r
-                ep_len += test_env.action_repeat
+                if hasattr(test_env, 'action_repeat'):
+                    ep_len += test_env.action_repeat
+                else:
+                    ep_len += 1
                 # Add short history
                 if max_hist_len != 0:
                     if o_buff_len == max_hist_len:
@@ -803,7 +824,10 @@ def lstm_td3(resume_exp_dir=None,
         o2, r, d, _ = env.step(a)
 
         ep_ret += r
-        ep_len += env.action_repeat
+        if hasattr(env, 'action_repeat'):
+            ep_len += env.action_repeat
+        else:
+            ep_len += 1
 
         # Ignore the "done" signal if it comes from hitting the time
         # horizon (that is, when it's an artificial terminal signal

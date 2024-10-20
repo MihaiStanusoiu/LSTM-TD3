@@ -12,7 +12,7 @@ setup(
     install_requires=[
         'joblib',
         'gym<=0.17.3',
-        'numpy',
+        'numpy==1.26.4',
         'pybullet',
         'torch',
         'pandas',
