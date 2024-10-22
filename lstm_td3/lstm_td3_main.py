@@ -293,7 +293,8 @@ class MLPActor(nn.Module):
             # input_size = mem_pre_lstm_layer_size[-1]
             input_size = obs_dim
             wiring = ncps.wirings.AutoNCP(mem_lstm_hid_sizes[0], act_dim)
-            self.rnn = CfC(input_size, wiring, batch_first=True, return_sequences=True)
+            # self.rnn = CfC(input_size, wiring, batch_first=True, return_sequences=True)
+            self.rnn = LTC(input_size, wiring, batch_first=True, return_sequences=True)
             # self.rnn = CfC(input_size, mem_lstm_hid_sizes[0], batch_first=True,
             #                backbone_layers=list(mem_pre_lstm_hid_sizes).__len__(),
             #                backbone_units=mem_pre_lstm_hid_sizes[0])
