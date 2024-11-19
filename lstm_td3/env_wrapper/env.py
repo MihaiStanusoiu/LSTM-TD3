@@ -300,10 +300,9 @@ def make_bullet_task(env_id, dp_type='MDP',
     env = BulletViewer(env=env, fps=fps, render_width=render_width, render_height=render_height)
     return env
 
-def make_dmc_manipulator(env: DeepMindControl=None, use_relative_timestep=False, seed=None):
-    if env is None:
-        # env = DeepMindControl("reacher_easy", 2, seed=seed)
-        env = DMCEnv("reacher", "easy", from_pixels=False, frame_skip=2, task_kwargs={"random":seed})
+def make_dmc_manipulator(task="reacher", variant="easy", use_relative_timestep=False, seed=None):
+    # env = DeepMindControl(env_name, 2, seed=seed)
+    env = DMCEnv(task, variant, from_pixels=False, frame_skip=2, task_kwargs={"random":seed})
     return NormalizeActions(env)
 
 

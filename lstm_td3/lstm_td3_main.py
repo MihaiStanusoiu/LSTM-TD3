@@ -1,4 +1,6 @@
 from copy import deepcopy
+from enum import Enum
+
 import numpy as np
 import pybullet_envs    # To register tasks in PyBullet
 import gym
@@ -6,6 +8,8 @@ import time
 import torch
 import torch.nn as nn
 from torch.optim import Adam
+
+from lstm_td3.test.test_envs import make_test_env_pi
 from lstm_td3.utils.logx import EpochLogger, setup_logger_kwargs, colorize, TensorBoardLogger
 import itertools
 from lstm_td3.env_wrapper.pomdp_wrapper import POMDPWrapper
@@ -15,6 +19,13 @@ import os.path as osp
 import json
 from collections import namedtuple
 
+import ncps
+from ncps.torch import LTC, CfC
+
+class SequenceCellType(Enum):
+    LSTM="lstm"
+    LTC="ltc"
+    CFC="cfc"
 
 class ReplayBuffer:
     """
@@ -112,7 +123,7 @@ class ReplayBuffer:
 
 
 class MLPCritic(nn.Module):
-    def __init__(self, obs_dim, act_dim,
+    def __init__(self, obs_dim, act_dim, rnn_cell_type: SequenceCellType,
                  mem_pre_lstm_hid_sizes=(128,),
                  mem_lstm_hid_sizes=(128,),
                  mem_after_lstm_hid_size=(128,),
@@ -122,6 +133,7 @@ class MLPCritic(nn.Module):
         super(MLPCritic, self).__init__()
         self.obs_dim = obs_dim
         self.act_dim = act_dim
+        self.rnn_cell_type = rnn_cell_type
         self.hist_with_past_act = hist_with_past_act
         #
         self.mem_pre_lstm_layers = nn.ModuleList()
@@ -131,7 +143,12 @@ class MLPCritic(nn.Module):
         self.cur_feature_layers = nn.ModuleList()
         self.post_combined_layers = nn.ModuleList()
         # Memory
-        #    Pre-LSTM
+
+        hidden_layer_factory = None
+        if rnn_cell_type == SequenceCellType.LSTM.value:
+            hidden_layer_factory = lambda input_size, output_size: nn.LSTM(input_size, output_size, batch_first=True)
+        else:
+            hidden_layer_factory = lambda input_size, units: CfC(input_size, units, batch_first=True, backbone_layers=list(mem_pre_lstm_hid_sizes).__len__(), backbone_units=mem_pre_lstm_hid_sizes[0])
         if self.hist_with_past_act:
             mem_pre_lstm_layer_size = [obs_dim + act_dim] + list(mem_pre_lstm_hid_sizes)
         else:
@@ -140,17 +157,14 @@ class MLPCritic(nn.Module):
             self.mem_pre_lstm_layers += [nn.Linear(mem_pre_lstm_layer_size[h],
                                                    mem_pre_lstm_layer_size[h + 1]),
                                          nn.ReLU()]
-        #    LSTM
         self.mem_lstm_layer_sizes = [mem_pre_lstm_layer_size[-1]] + list(mem_lstm_hid_sizes)
         for h in range(len(self.mem_lstm_layer_sizes) - 1):
-            self.mem_lstm_layers += [
-                nn.LSTM(self.mem_lstm_layer_sizes[h], self.mem_lstm_layer_sizes[h + 1], batch_first=True)]
-
+            self.mem_lstm_layers += [hidden_layer_factory(self.mem_lstm_layer_sizes[h], self.mem_lstm_layer_sizes[h + 1])]
         #   After-LSTM
         self.mem_after_lstm_layer_size = [self.mem_lstm_layer_sizes[-1]] + list(mem_after_lstm_hid_size)
-        for h in range(len(self.mem_after_lstm_layer_size)-1):
+        for h in range(len(self.mem_after_lstm_layer_size) - 1):
             self.mem_after_lstm_layers += [nn.Linear(self.mem_after_lstm_layer_size[h],
-                                                     self.mem_after_lstm_layer_size[h+1]),
+                                                     self.mem_after_lstm_layer_size[h + 1]),
                                            nn.ReLU()]
 
         # Current Feature Extraction
@@ -168,6 +182,17 @@ class MLPCritic(nn.Module):
         self.post_combined_layers += [nn.Linear(post_combined_layer_size[-2], post_combined_layer_size[-1]),
                                       nn.Identity()]
 
+    # def build_rnn_layer(self, units, output_size, batch_first):
+    #     if self.rnn_cell_type == SequenceCellType.LSTM:
+    #         return nn.LSTM(units, output_size, batch_first=batch_first)
+    #     elif self.rnn_cell_type == SequenceCellType.LTC:
+    #         wiring = ncps.wirings.Random(units, output_size, 0.75)
+    #         return LTC(units, wiring, batch_first=batch_first)
+    #     elif self.rnn_cell_type == SequenceCellType.CFC:
+    #         return CfC(units, output_size, batch_first=batch_first)
+    #     else:
+    #         raise ValueError("Invalid rnn_cell_type")
+
     def forward(self, obs, act, hist_obs, hist_act, hist_seg_len):
         #
         tmp_hist_seg_len = deepcopy(hist_seg_len)
@@ -182,14 +207,17 @@ class MLPCritic(nn.Module):
             x = layer(x)
         #    LSTM
         for layer in self.mem_lstm_layers:
-            x, (lstm_hidden_state, lstm_cell_state) = layer(x)
+            x, h = layer(x)
         #    After-LSTM
         for layer in self.mem_after_lstm_layers:
             x = layer(x)
-        #    History output mask to reduce disturbance cased by none history memory
-        hist_out = torch.gather(x, 1,
-                                (tmp_hist_seg_len - 1).view(-1, 1).repeat(1, self.mem_after_lstm_layer_size[-1]).unsqueeze(
-                                    1).long()).squeeze(1)
+        if self.rnn_cell_type == SequenceCellType.LSTM.value:
+            hist_out = torch.gather(x, 1,
+                                    (tmp_hist_seg_len - 1).view(-1, 1).repeat(1, self.mem_after_lstm_layer_size[
+                                        -1]).unsqueeze(
+                                        1).long()).squeeze(1)
+        else:
+            hist_out = h
 
         # Current Feature Extraction
         x = torch.cat([obs, act], dim=-1)
@@ -207,7 +235,7 @@ class MLPCritic(nn.Module):
 
 
 class MLPActor(nn.Module):
-    def __init__(self, obs_dim, act_dim, act_limit,
+    def __init__(self, obs_dim, act_dim, act_limit, rnn_cell_type: SequenceCellType,
                  mem_pre_lstm_hid_sizes=(128,),
                  mem_lstm_hid_sizes=(128,),
                  mem_after_lstm_hid_size=(128,),
@@ -218,6 +246,7 @@ class MLPActor(nn.Module):
         self.obs_dim = obs_dim
         self.act_dim = act_dim
         self.act_limit = act_limit
+        self.rnn_cell_type = rnn_cell_type
         self.hist_with_past_act = hist_with_past_act
         #
         self.mem_pre_lstm_layers = nn.ModuleList()
@@ -228,26 +257,58 @@ class MLPActor(nn.Module):
         self.post_combined_layers = nn.ModuleList()
 
         # Memory
-        #    Pre-LSTM
-        if self.hist_with_past_act:
-            mem_pre_lstm_layer_size = [obs_dim + act_dim] + list(mem_pre_lstm_hid_sizes)
-        else:
+        if rnn_cell_type in [SequenceCellType.LSTM.value, SequenceCellType.CFC.value]:
+            if rnn_cell_type == SequenceCellType.LSTM.value:
+                hidden_layer_factory = lambda input_size, output_size: nn.LSTM(input_size, output_size,
+                                                                               batch_first=True)
+            else:
+                hidden_layer_factory = lambda input_size, units: CfC(input_size, units, batch_first=True,
+                                                                     backbone_layers=list(
+                                                                         mem_pre_lstm_hid_sizes).__len__(),
+                                                                     backbone_units=mem_pre_lstm_hid_sizes[0])
+            #    Pre-LSTM
+            if self.hist_with_past_act:
+                mem_pre_lstm_layer_size = [obs_dim + act_dim] + list(mem_pre_lstm_hid_sizes)
+            else:
+                mem_pre_lstm_layer_size = [obs_dim] + list(mem_pre_lstm_hid_sizes)
+            for h in range(len(mem_pre_lstm_layer_size) - 1):
+                self.mem_pre_lstm_layers += [nn.Linear(mem_pre_lstm_layer_size[h],
+                                                       mem_pre_lstm_layer_size[h + 1]),
+                                             nn.ReLU()]
+            #    LSTM
+            self.mem_lstm_layer_sizes = [mem_pre_lstm_layer_size[-1]] + list(mem_lstm_hid_sizes)
+            for h in range(len(self.mem_lstm_layer_sizes) - 1):
+                self.mem_lstm_layers += [hidden_layer_factory(self.mem_lstm_layer_sizes[h], self.mem_lstm_layer_sizes[h + 1])]
+            #   After-LSTM
+            self.mem_after_lstm_layer_size = [self.mem_lstm_layer_sizes[-1]] + list(mem_after_lstm_hid_size)
+            for h in range(len(self.mem_after_lstm_layer_size) - 1):
+                self.mem_after_lstm_layers += [nn.Linear(self.mem_after_lstm_layer_size[h],
+                                                         self.mem_after_lstm_layer_size[h + 1]),
+                                               nn.ReLU()]
+        elif rnn_cell_type == SequenceCellType.LTC.value:
+            #    Pre-LTC NPC
             mem_pre_lstm_layer_size = [obs_dim] + list(mem_pre_lstm_hid_sizes)
-        for h in range(len(mem_pre_lstm_layer_size) - 1):
-            self.mem_pre_lstm_layers += [nn.Linear(mem_pre_lstm_layer_size[h],
-                                                   mem_pre_lstm_layer_size[h + 1]),
-                                         nn.ReLU()]
-        #    LSTM
-        self.mem_lstm_layer_sizes = [mem_pre_lstm_layer_size[-1]] + list(mem_lstm_hid_sizes)
-        for h in range(len(self.mem_lstm_layer_sizes) - 1):
-            self.mem_lstm_layers += [
-                nn.LSTM(self.mem_lstm_layer_sizes[h], self.mem_lstm_layer_sizes[h + 1], batch_first=True)]
-        #   After-LSTM
-        self.mem_after_lstm_layer_size = [self.mem_lstm_layer_sizes[-1]] + list(mem_after_lstm_hid_size)
-        for h in range(len(self.mem_after_lstm_layer_size) - 1):
-            self.mem_after_lstm_layers += [nn.Linear(self.mem_after_lstm_layer_size[h],
-                                                     self.mem_after_lstm_layer_size[h + 1]),
-                                           nn.ReLU()]
+            for h in range(len(mem_pre_lstm_layer_size) - 1):
+                self.mem_pre_lstm_layers += [nn.Linear(mem_pre_lstm_layer_size[h],
+                                                       mem_pre_lstm_layer_size[h + 1]),
+                                             nn.ReLU()]
+            # input_size = mem_pre_lstm_layer_size[-1]
+            input_size = obs_dim
+            wiring = ncps.wirings.AutoNCP(mem_lstm_hid_sizes[0], act_dim)
+            # self.rnn = CfC(input_size, wiring, batch_first=True, return_sequences=True)
+            self.rnn = LTC(input_size, wiring, batch_first=True, return_sequences=False)
+            # self.rnn = CfC(input_size, mem_lstm_hid_sizes[0], batch_first=True,
+            #                backbone_layers=list(mem_pre_lstm_hid_sizes).__len__(),
+            #                backbone_units=mem_pre_lstm_hid_sizes[0])
+            self.mem_after_lstm_layer_size = [mem_lstm_hid_sizes[0]]
+        else:
+            input_size = obs_dim
+            if hist_with_past_act:
+                input_size += act_dim
+            self.rnn = CfC(input_size, mem_lstm_hid_sizes[0], batch_first=True,
+                           backbone_layers=list(mem_pre_lstm_hid_sizes).__len__(),
+                           backbone_units=mem_pre_lstm_hid_sizes[0])
+            self.mem_after_lstm_layer_size = [mem_lstm_hid_sizes[0]]
 
         # Current Feature Extraction
         cur_feature_layer_size = [obs_dim] + list(cur_feature_hid_sizes)
@@ -272,18 +333,29 @@ class MLPActor(nn.Module):
         else:
             x = hist_obs
         # Memory
-        #    Pre-LSTM
-        for layer in self.mem_pre_lstm_layers:
-            x = layer(x)
-        #    LSTM
-        for layer in self.mem_lstm_layers:
-            x, (lstm_hidden_state, lstm_cell_state) = layer(x)
-        #    After-LSTM
-        for layer in self.mem_after_lstm_layers:
-            x = layer(x)
-        hist_out = torch.gather(x, 1,
-                                (tmp_hist_seg_len - 1).view(-1, 1).repeat(1, self.mem_after_lstm_layer_size[-1]).unsqueeze(
-                                    1).long()).squeeze(1)
+        if self.rnn_cell_type == SequenceCellType.LTC.value:
+            # for layer in self.mem_pre_lstm_layers:
+            #     x = layer(x)
+            x = torch.cat((hist_obs, obs.unsqueeze(dim=1)), dim=1)
+            x, h = self.rnn(x)
+            return self.act_limit * x, h
+        else:
+            #    Pre-LSTM
+            for layer in self.mem_pre_lstm_layers:
+                x = layer(x)
+            #    LSTM
+            for layer in self.mem_lstm_layers:
+                x, h = layer(x)
+            #    After-LSTM
+            for layer in self.mem_after_lstm_layers:
+                x = layer(x)
+
+            if self.rnn_cell_type == SequenceCellType.LSTM.value:
+                hist_out = torch.gather(x, 1,
+                                        (tmp_hist_seg_len - 1).view(-1, 1).repeat(1, self.mem_after_lstm_layer_size[-1]).unsqueeze(
+                                            1).long()).squeeze(1)
+            else:
+                hist_out = h
 
         # Current Feature Extraction
         x = obs
@@ -300,7 +372,7 @@ class MLPActor(nn.Module):
 
 
 class MLPActorCritic(nn.Module):
-    def __init__(self, obs_dim, act_dim, act_limit=1,
+    def __init__(self, obs_dim, act_dim, rnn_cell_type: SequenceCellType, act_limit=1,
                  critic_mem_pre_lstm_hid_sizes=(128,),
                  critic_mem_lstm_hid_sizes=(128,),
                  critic_mem_after_lstm_hid_size=(128,),
@@ -314,21 +386,21 @@ class MLPActorCritic(nn.Module):
                  actor_post_comb_hid_sizes=(128,),
                  actor_hist_with_past_act=False):
         super(MLPActorCritic, self).__init__()
-        self.q1 = MLPCritic(obs_dim, act_dim,
+        self.q1 = MLPCritic(obs_dim, act_dim, rnn_cell_type,
                             mem_pre_lstm_hid_sizes=critic_mem_pre_lstm_hid_sizes,
                             mem_lstm_hid_sizes=critic_mem_lstm_hid_sizes,
                             mem_after_lstm_hid_size=critic_mem_after_lstm_hid_size,
                             cur_feature_hid_sizes=critic_cur_feature_hid_sizes,
                             post_comb_hid_sizes=critic_post_comb_hid_sizes,
                             hist_with_past_act=critic_hist_with_past_act)
-        self.q2 = MLPCritic(obs_dim, act_dim,
+        self.q2 = MLPCritic(obs_dim, act_dim, rnn_cell_type,
                             mem_pre_lstm_hid_sizes=critic_mem_pre_lstm_hid_sizes,
                             mem_lstm_hid_sizes=critic_mem_lstm_hid_sizes,
                             mem_after_lstm_hid_size=critic_mem_after_lstm_hid_size,
                             cur_feature_hid_sizes=critic_cur_feature_hid_sizes,
                             post_comb_hid_sizes=critic_post_comb_hid_sizes,
                             hist_with_past_act=critic_hist_with_past_act)
-        self.pi = MLPActor(obs_dim, act_dim, act_limit,
+        self.pi = MLPActor(obs_dim, act_dim, act_limit, rnn_cell_type,
                            mem_pre_lstm_hid_sizes=actor_mem_pre_lstm_hid_sizes,
                            mem_lstm_hid_sizes=actor_mem_lstm_hid_sizes,
                            mem_after_lstm_hid_size=actor_mem_after_lstm_hid_size,
@@ -358,6 +430,7 @@ def lstm_td3(resume_exp_dir=None,
              noise_clip=0.5, policy_delay=2, num_test_episodes=10, max_ep_len=1000,
              batch_size=100,
              max_hist_len=100,
+             rnn_cell_type: SequenceCellType = SequenceCellType.LSTM,
              partially_observable=False,
              pomdp_type = 'remove_velocity',
              flicker_prob=0.2, random_noise_sigma=0.1, random_sensor_missing_prob=0.1,
@@ -484,8 +557,13 @@ def lstm_td3(resume_exp_dir=None,
     np.random.seed(seed)
 
     if env_name.startswith("DMC"):
-        env = make_dmc_manipulator(seed=seed)
-        test_env = make_dmc_manipulator(seed=seed)
+        env_name_no_domain = env_name.removeprefix("DMC_")
+        task, variant = env_name_no_domain.split("_", 1)
+        env = make_dmc_manipulator(task, variant, seed=seed)
+        test_env = make_dmc_manipulator(task, variant, seed=seed)
+    elif env_name.startswith("test"):
+        env = make_test_env_pi()
+        test_env = make_test_env_pi()
     else:
         # Wrapper environment if using POMDP
         if partially_observable:
@@ -505,7 +583,7 @@ def lstm_td3(resume_exp_dir=None,
     act_limit = env.action_space.high[0]
 
     # Create actor-critic module and target networks
-    ac = MLPActorCritic(obs_dim, act_dim, act_limit,
+    ac = MLPActorCritic(obs_dim, act_dim, rnn_cell_type, act_limit,
                         critic_mem_pre_lstm_hid_sizes=critic_mem_pre_lstm_hid_sizes,
                         critic_mem_lstm_hid_sizes=critic_mem_lstm_hid_sizes,
                         critic_mem_after_lstm_hid_size=critic_mem_after_lstm_hid_size,
@@ -591,7 +669,7 @@ def lstm_td3(resume_exp_dir=None,
         o, h_o, h_a, h_o_len = data['obs'], data['hist_obs'], data['hist_act'], data['hist_obs_len']
         a, a_extracted_memory = ac.pi(o, h_o, h_a, h_o_len)
         q1_pi, _ = ac.q1(o, a, h_o, h_a, h_o_len)
-        loss_info = dict(ActExtractedMemory=a_extracted_memory.mean(dim=1).detach().cpu().numpy())
+        loss_info = dict(ActExtractedMemory=a_extracted_memory.mean(dim=-1).detach().cpu().numpy())
         return -q1_pi.mean(), loss_info
 
     # Set up optimizers for policy and q-function
@@ -666,7 +744,10 @@ def lstm_td3(resume_exp_dir=None,
                 o2, r, d, _ = test_env.step(a)
 
                 ep_ret += r
-                ep_len += test_env.action_repeat
+                if hasattr(test_env, 'action_repeat'):
+                    ep_len += test_env.action_repeat
+                else:
+                    ep_len += 1
                 # Add short history
                 if max_hist_len != 0:
                     if o_buff_len == max_hist_len:
@@ -747,7 +828,10 @@ def lstm_td3(resume_exp_dir=None,
         o2, r, d, _ = env.step(a)
 
         ep_ret += r
-        ep_len += env.action_repeat
+        if hasattr(env, 'action_repeat'):
+            ep_len += env.action_repeat
+        else:
+            ep_len += 1
 
         # Ignore the "done" signal if it comes from hitting the time
         # horizon (that is, when it's an artificial terminal signal
@@ -883,6 +967,7 @@ if __name__ == '__main__':
                                  'remove_velocity_and_random_sensor_missing', 'flickering_and_random_noise',
                                  'random_noise_and_random_sensor_missing', 'random_sensor_missing_and_random_noise'],
                         default='remove_velocity')
+    parser.add_argument('--rnn_cell_type', choices=['lstm', 'cfc', 'ltc'], default='lstm')
     parser.add_argument('--flicker_prob', type=float, default=0.2)
     parser.add_argument('--random_noise_sigma', type=float, default=0.1)
     parser.add_argument('--random_sensor_missing_prob', type=float, default=0.1)
@@ -890,17 +975,17 @@ if __name__ == '__main__':
                         help="Using double critic")
     parser.add_argument('--use_target_policy_smooth', type=str2bool, nargs='?', const=True, default=True,
                         help="Using target policy smoothing")
-    parser.add_argument('--critic_mem_pre_lstm_hid_sizes', type=int, nargs="+", default=[128])
-    parser.add_argument('--critic_mem_lstm_hid_sizes', type=int, nargs="+", default=[128])
+    parser.add_argument('--critic_mem_pre_lstm_hid_sizes', type=int, nargs="+", default=[64])
+    parser.add_argument('--critic_mem_lstm_hid_sizes', type=int, nargs="+", default=[64])
     parser.add_argument('--critic_mem_after_lstm_hid_size', type=int, nargs="+", default=[])
-    parser.add_argument('--critic_cur_feature_hid_sizes', type=int, nargs="?", default=[128, 128])
-    parser.add_argument('--critic_post_comb_hid_sizes', type=int, nargs="+", default=[128])
+    parser.add_argument('--critic_cur_feature_hid_sizes', type=int, nargs="?", default=[64, 64])
+    parser.add_argument('--critic_post_comb_hid_sizes', type=int, nargs="+", default=[64])
     parser.add_argument('--critic_hist_with_past_act', type=str2bool, nargs='?', const=True, default=True)
-    parser.add_argument('--actor_mem_pre_lstm_hid_sizes', type=int, nargs="+", default=[128])
-    parser.add_argument('--actor_mem_lstm_hid_sizes', type=int, nargs="+", default=[128])
+    parser.add_argument('--actor_mem_pre_lstm_hid_sizes', type=int, nargs="+", default=[64])
+    parser.add_argument('--actor_mem_lstm_hid_sizes', type=int, nargs="+", default=[64])
     parser.add_argument('--actor_mem_after_lstm_hid_size', type=int, nargs="+", default=[])
-    parser.add_argument('--actor_cur_feature_hid_sizes', type=int, nargs="?", default=[128, 128])
-    parser.add_argument('--actor_post_comb_hid_sizes', type=int, nargs="+", default=[128])
+    parser.add_argument('--actor_cur_feature_hid_sizes', type=int, nargs="?", default=[64, 64])
+    parser.add_argument('--actor_post_comb_hid_sizes', type=int, nargs="+", default=[64])
     parser.add_argument('--actor_hist_with_past_act', type=str2bool, nargs='?', const=True, default=True)
     parser.add_argument('--exp_name', type=str, default='lstm_td3')
     parser.add_argument("--data_dir", type=str, default='spinup_data_lstm_gate')
@@ -954,6 +1039,7 @@ if __name__ == '__main__':
              random_sensor_missing_prob=args.random_sensor_missing_prob,
              use_double_critic=args.use_double_critic,
              use_target_policy_smooth=args.use_target_policy_smooth,
+             rnn_cell_type=args.rnn_cell_type,
              critic_mem_pre_lstm_hid_sizes=tuple(args.critic_mem_pre_lstm_hid_sizes),
              critic_mem_lstm_hid_sizes=tuple(args.critic_mem_lstm_hid_sizes),
              critic_mem_after_lstm_hid_size=tuple(args.critic_mem_after_lstm_hid_size),
