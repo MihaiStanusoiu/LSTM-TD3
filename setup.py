@@ -19,7 +19,8 @@ setup(
         'gymnasium',
         'dm_control',
         'tensorboard',
-        'ncps'
+        'ncps',
+        'wandb'
     ],
     description="Long-Short-Term-Memory-based Twine Delayed Deep Deterministic Policy Gradient (LSTM-TD3)",
     author="Lingheng Meng",

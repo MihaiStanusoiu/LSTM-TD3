@@ -1,3 +1,5 @@
+import os
+
 import numpy as np
 
 def statistics_scalar(x, with_min_and_max=False):
@@ -23,3 +25,11 @@ def statistics_scalar(x, with_min_and_max=False):
         global_max = np.max(x) if len(x) > 0 else -np.inf
         return mean, std, global_min, global_max
     return mean, std
+
+def make_dir(dir_path):
+	"""Create directory if it does not already exist."""
+	try:
+		os.makedirs(dir_path)
+	except OSError:
+		pass
+	return dir_path

@@ -14,9 +14,11 @@ import pandas as pd
 import torch
 import os.path as osp, time, atexit, os
 import warnings
+import wandb
 
 from torch.utils.tensorboard import SummaryWriter
 
+from lstm_td3.utils.recorder import VideoRecorder
 from lstm_td3.utils.tools import statistics_scalar
 from lstm_td3.utils.serialization_utils import convert_json
 from lstm_td3.user_config import DEFAULT_DATA_DIR, FORCE_DATESTAMP
@@ -401,6 +403,25 @@ class Logger:
         self.log_current_row.clear()
         self.first_row=False
 
+# class WandbLogger(EpochLogger):
+#     def __init__(self, project, entity, name,  *args, **kwargs):
+#         super().__init__(*args, **kwargs)
+#         wandb.login(key="0b961bb8b95bbca48519a84eeca715dc4187268f")
+#         wandb.init(
+#             project=project,
+#             entity=entity,
+#             name=name,
+#             dir=self.output_dir
+#         )
+#         self._wandb = wandb
+#
+#     def dump_tabular(self):
+#         super().dump_tabular()
+#
+#     def finish(self):
+#         self._wandb.finish()
+
+
 class EpochLogger(Logger):
     """
     A variant of Logger tailored for tracking average values over epochs.
@@ -426,9 +447,22 @@ class EpochLogger(Logger):
     to record the desired values.
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, seed=1, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.epoch_dict = dict()
+        wandb.login(key="0b961bb8b95bbca48519a84eeca715dc4187268f")
+        wandb.init(
+            project="LTC-TD3",
+            entity="mihaistanusoiu-tu-wien",
+            name=str(seed),
+            dir=self.output_dir
+        )
+        self._wandb = wandb
+        self._recorder = VideoRecorder(self.output_dir, self._wandb)
+
+    @property
+    def video(self):
+        return self._recorder
 
     def store(self, **kwargs):
         """
@@ -441,6 +475,7 @@ class EpochLogger(Logger):
             if not(k in self.epoch_dict.keys()):
                 self.epoch_dict[k] = []
             self.epoch_dict[k].append(v)
+            self._wandb.log({k: v})
 
     def log_tabular(self, key, val=None, with_min_and_max=False, average_only=False):
         """
@@ -473,6 +508,7 @@ class EpochLogger(Logger):
             if with_min_and_max:
                 super().log_tabular('Max'+key, stats[3])
                 super().log_tabular('Min'+key, stats[2])
+
         self.epoch_dict[key] = []
 
     def get_stats(self, key):

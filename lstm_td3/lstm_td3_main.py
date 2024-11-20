@@ -2,13 +2,13 @@ from copy import deepcopy
 from enum import Enum
 
 import numpy as np
-import pybullet_envs    # To register tasks in PyBullet
-import gym
+import gymnasium as gym
 import time
 import torch
 import torch.nn as nn
 from torch.optim import Adam
 
+from lstm_td3.env_wrapper.metaworld_wrapper import make_mw_env
 from lstm_td3.test.test_envs import make_test_env_pi
 from lstm_td3.utils.logx import EpochLogger, setup_logger_kwargs, colorize, TensorBoardLogger
 import itertools
@@ -548,10 +548,10 @@ def lstm_td3(resume_exp_dir=None,
     """
     # If not going to resume, create new logger.
     if resume_exp_dir is None:
-        logger = TensorBoardLogger(**logger_kwargs)
+        logger = EpochLogger(seed=seed, **logger_kwargs)
         logger.save_config(locals())
     else:
-        logger = TensorBoardLogger(**logger_kwargs)
+        logger = EpochLogger(seed=seed, **logger_kwargs)
 
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -564,6 +564,9 @@ def lstm_td3(resume_exp_dir=None,
     elif env_name.startswith("test"):
         env = make_test_env_pi()
         test_env = make_test_env_pi()
+    elif env_name.startswith("mw"):
+        env = make_mw_env(env_name, seed=seed)
+        test_env = make_mw_env(env_name, seed=seed)
     else:
         # Wrapper environment if using POMDP
         if partially_observable:
@@ -597,6 +600,8 @@ def lstm_td3(resume_exp_dir=None,
                         actor_post_comb_hid_sizes=actor_post_comb_hid_sizes,
                         actor_hist_with_past_act=actor_hist_with_past_act)
     ac_targ = deepcopy(ac)
+    # ac = torch.compile(ac)
+    # ac_targ = torch.compile(ac_targ)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     ac.to(device)
     ac_targ.to(device)
@@ -724,9 +729,10 @@ def lstm_td3(resume_exp_dir=None,
         a += noise_scale * np.random.randn(act_dim)
         return np.clip(a, -act_limit, act_limit)
 
-    def test_agent():
+    def test_agent(step):
         for j in range(num_test_episodes):
-            o, d, ep_ret, ep_len = test_env.reset(), False, 0, 0
+            (o, _), d, tr, ep_ret, ep_len = test_env.reset(), False, False, 0, 0
+            logger.video.init(test_env, enabled=(j == 0))
 
             if max_hist_len > 0:
                 o_buff = np.zeros([max_hist_len, obs_dim])
@@ -738,11 +744,11 @@ def lstm_td3(resume_exp_dir=None,
                 a_buff = np.zeros([1, act_dim])
                 o_buff_len = 0
 
-            while not (d or (ep_len == max_ep_len)):
+            while not (d or tr or (ep_len == max_ep_len)):
                 # Take deterministic actions at test time (noise_scale=0)
                 a = get_action(o, o_buff, a_buff, o_buff_len, 0, device)
-                o2, r, d, _ = test_env.step(a)
-
+                o2, r, d, tr, _ = test_env.step(a)
+                logger.video.record(test_env)
                 ep_ret += r
                 if hasattr(test_env, 'action_repeat'):
                     ep_len += test_env.action_repeat
@@ -761,6 +767,7 @@ def lstm_td3(resume_exp_dir=None,
                         o_buff_len += 1
                 o = o2
 
+            logger.video.save(step)
             logger.store(TestEpRet=ep_ret, TestEpLen=ep_len)
 
     # Prepare for interaction with environment
@@ -768,7 +775,7 @@ def lstm_td3(resume_exp_dir=None,
     total_steps = steps_per_epoch * epochs
     start_time = time.time()
     past_t = 0
-    o, ep_ret, ep_len = env.reset(), 0, 0
+    (o, _), ep_ret, ep_len = env.reset(), 0, 0
 
     if max_hist_len > 0:
         o_buff = np.zeros([max_hist_len, obs_dim])
@@ -814,6 +821,7 @@ def lstm_td3(resume_exp_dir=None,
         q_optimizer.load_state_dict(model_checkpoint['q_optimizer_state_dict'])
 
     print("past_t={}".format(past_t))
+    test_agent(0)
     # Main loop: collect experience in env and update/log each epoch
     for t in range(past_t, total_steps):  # Start from the step after resuming.
         # Until start_steps have elapsed, randomly sample actions
@@ -825,7 +833,7 @@ def lstm_td3(resume_exp_dir=None,
             a = env.action_space.sample()
 
         # Step the env
-        o2, r, d, _ = env.step(a)
+        o2, r, d, tr, _ = env.step(a)
 
         ep_ret += r
         if hasattr(env, 'action_repeat'):
@@ -858,9 +866,9 @@ def lstm_td3(resume_exp_dir=None,
         o = o2
 
         # End of trajectory handling
-        if d or (ep_len == max_ep_len):
+        if d or tr or (ep_len == max_ep_len):
             logger.store(EpRet=ep_ret, EpLen=ep_len)
-            o, ep_ret, ep_len = env.reset(), 0, 0
+            (o, _), ep_ret, ep_len = env.reset(), 0, 0
 
             if max_hist_len > 0:
                 o_buff = np.zeros([max_hist_len, obs_dim])
@@ -883,7 +891,7 @@ def lstm_td3(resume_exp_dir=None,
                 'Step-%d' % t if t is not None else '') + '.pt'
             model_fname = 'checkpoint-model-' + ('Step-%d' % t if t is not None else '') + '.pt'
 
-            context_elements = {'env': env, 'replay_buffer': replay_buffer,
+            context_elements = {'replay_buffer': replay_buffer,
                                 'logger_epoch_dict': logger.epoch_dict,
                                 'start_time': start_time, 't': t}
             model_elements = {'ac_state_dict': ac.state_dict(),
@@ -891,7 +899,7 @@ def lstm_td3(resume_exp_dir=None,
                               'pi_optimizer_state_dict': pi_optimizer.state_dict(),
                               'q_optimizer_state_dict': q_optimizer.state_dict()}
             context_fname = osp.join(fpath, context_fname)
-            torch.save(context_elements, context_fname)
+            torch.save(context_elements, context_fname) #TODO: fix metaworld env saving
             model_fname = osp.join(fpath, model_fname)
             torch.save(model_elements, model_fname)
             # Rename the file to verify the completion of the saving.
@@ -916,7 +924,7 @@ def lstm_td3(resume_exp_dir=None,
         if (t + 1) % steps_per_epoch == 0:
             epoch = (t + 1) // steps_per_epoch
             # Test the performance of the deterministic version of the agent.
-            test_agent()
+            test_agent(t + 1)
 
             # Log info about epoch
             logger.log_tabular('scalars/Epoch', epoch, timestep=epoch)
@@ -936,6 +944,7 @@ def lstm_td3(resume_exp_dir=None,
             logger.log_tabular('scalars/Time', time.time() - start_time, timestep=epoch)
             logger.dump_tabular()
 
+    logger.finish()
 
 def str2bool(v):
     """Function used in argument parser for converting string to bool."""
