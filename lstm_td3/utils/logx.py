@@ -498,16 +498,21 @@ class EpochLogger(Logger):
         """
         if val is not None:
             super().log_tabular(key,val)
+            self._wandb.log({key: val})
         else:
             v = self.epoch_dict[key]
             vals = np.concatenate(v) if isinstance(v[0], np.ndarray) and len(v[0].shape)>0 else v
             stats = statistics_scalar(vals, with_min_and_max=with_min_and_max)
             super().log_tabular(key if average_only else 'Average' + key, stats[0])
+            self._wandb.log({key if average_only else 'Average' + key: stats[0]})
             if not(average_only):
                 super().log_tabular('Std'+key, stats[1])
+                self._wandb.log({'Std'+key: stats[1]})
             if with_min_and_max:
                 super().log_tabular('Max'+key, stats[3])
                 super().log_tabular('Min'+key, stats[2])
+                self._wandb.log({'Max'+key: stats[3]})
+                self._wandb.log({'Min'+key: stats[2]})
 
         self.epoch_dict[key] = []
 

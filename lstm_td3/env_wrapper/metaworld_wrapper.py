@@ -26,10 +26,12 @@ class MetaWorldWrapper(gym.Wrapper):
     def step(self, action):
         reward = 0
         for _ in range(self.env.action_repeat):
-            obs, r, _, _, info = self.env.step(action.copy())
+            obs, r, d, tr, info = self.env.step(action.copy())
             reward += r
+            if tr:
+                break
         obs = obs.astype(np.float32)
-        return obs, reward, _, _, info
+        return obs, reward, d, tr, info
 
 
     @property
@@ -49,6 +51,6 @@ def make_mw_env(task, seed=1):
         raise ValueError('Unknown task:', task)
     env = ALL_V2_ENVIRONMENTS_GOAL_HIDDEN[env_id](seed=seed)
     env = MetaWorldWrapper(env)
-    env = TimeLimit(env, max_episode_steps=100)
-    env.max_episode_steps = env._max_episode_steps
+    env.env.max_path_length = 200
+    env.max_episode_steps = 100
     return env
