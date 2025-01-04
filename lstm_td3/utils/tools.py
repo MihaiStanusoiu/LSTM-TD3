@@ -1,3 +1,6 @@
+import argparse
+from enum import Enum
+
 import numpy as np
 
 def statistics_scalar(x, with_min_and_max=False):
@@ -23,3 +26,25 @@ def statistics_scalar(x, with_min_and_max=False):
         global_max = np.max(x) if len(x) > 0 else -np.inf
         return mean, std, global_min, global_max
     return mean, std
+
+
+def str2bool(v):
+    """Function used in argument parser for converting string to bool."""
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ('yes', 'true', 't', 'y', '1'):
+        return True
+    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+        return False
+    else:
+        raise argparse.ArgumentTypeError('Boolean value expected.')
+
+
+def list2tuple(v):
+    return tuple(v)
+
+
+class SequenceCellType(Enum):
+    LSTM="lstm"
+    LTC="ltc"
+    CFC="cfc"

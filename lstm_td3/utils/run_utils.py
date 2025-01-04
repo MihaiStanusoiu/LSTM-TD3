@@ -1,10 +1,9 @@
 from spinup.user_config import DEFAULT_DATA_DIR, FORCE_DATESTAMP, \
                                DEFAULT_SHORTHAND, WAIT_BEFORE_LAUNCH
 from spinup.utils.logx import colorize
-from spinup.utils.mpi_tools import mpi_fork, msg
+from spinup.utils.mpi_tools import mpi_fork
 from spinup.utils.serialization_utils import convert_json
 import base64
-from copy import deepcopy
 import cloudpickle
 import json
 import numpy as np
@@ -555,3 +554,5 @@ def test_eg():
     eg.add('huh', 5)
     eg.add('no', 6, in_name=True)
     return eg.variants()
+
+
