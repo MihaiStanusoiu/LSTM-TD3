@@ -13,7 +13,7 @@ from lstm_td3.env_wrapper.env import make_dmc_manipulator, make_bullet_task
 from lstm_td3.env_wrapper.pomdp_wrapper import POMDPWrapper
 from lstm_td3.models import MLPActorCritic
 from lstm_td3.test.test_envs import make_test_env_pi
-from lstm_td3.utils.logx import TensorBoardLogger
+from lstm_td3.utils.logx import TensorBoardLogger, EpochLogger
 from lstm_td3.utils.tools import SequenceCellType
 
 
@@ -191,10 +191,10 @@ class RNN_TD3:
 
         # If not going to resume, create new logger.
         if resume_exp_dir is None:
-            self.logger = TensorBoardLogger(**logger_kwargs)
+            self.logger = EpochLogger(seed=seed, **logger_kwargs)
             self.logger.save_config(locals())
         else:
-            self.logger = TensorBoardLogger(**logger_kwargs)
+            self.logger = EpochLogger(seed=seed, **logger_kwargs)
 
         torch.manual_seed(seed)
         np.random.seed(seed)
@@ -323,10 +323,10 @@ class RNN_TD3:
         _update_val = getattr(self, "_update_val", None)
         if _update_val is not None:
             return _update_val
-        if self.compile:
-            update = torch.compile(self._update, mode="reduce-overhead")
-        else:
-            update = self._update
+        # if self.compile:
+        #     update = torch.compile(self._update, mode="reduce-overhead")
+        # else:
+        update = self._update
         self._update_val = update
         return self._update_val
 
@@ -379,9 +379,14 @@ class RNN_TD3:
         a += noise_scale * np.random.randn(self.act_dim)
         return np.clip(a, -self.act_limit, self.act_limit)
 
-    def test_agent(self):
+    def test_agent(self, step, inference=False):
+        if inference:
+            os.environ['MUJOCO_GL'] = 'glfw'
+
         for j in range(self.num_test_episodes):
             o, d, ep_ret, ep_len = self.test_env.reset(), False, 0, 0
+            if not inference:
+                self.logger.video.init(self.test_env, enabled=(j == 0))
 
             if self.max_hist_len > 0:
                 o_buff = np.zeros([self.max_hist_len, self.obs_dim])
@@ -397,6 +402,8 @@ class RNN_TD3:
                 # Take deterministic actions at test time (noise_scale=0)
                 a = self.get_action(o, o_buff, a_buff, o_buff_len, 0, self.device)
                 o2, r, d, _ = self.test_env.step(a)
+                if not inference:
+                    self.logger.video.record(self.test_env)
 
                 ep_ret += r
                 if hasattr(self.test_env, 'action_repeat'):
@@ -415,8 +422,41 @@ class RNN_TD3:
                         a_buff[o_buff_len + 1 - 1] = list(a)
                         o_buff_len += 1
                 o = o2
+            if not inference:
+                self.logger.video.save(step)
+                self.logger.store(TestEpRet=ep_ret, TestEpLen=ep_len)
 
-            self.logger.store(TestEpRet=ep_ret, TestEpLen=ep_len)
+    def load(self, path):
+        checkpoint_files = os.listdir(path)
+        latest_context_version = np.max([int(f_name.split('-')[3]) for f_name in checkpoint_files if
+                                         'context' in f_name and 'verified' in f_name])
+        latest_model_version = np.max([int(f_name.split('-')[3]) for f_name in checkpoint_files if
+                                       'model' in f_name and 'verified' in f_name])
+        if latest_context_version != latest_model_version:
+            latest_version = np.min([latest_context_version, latest_model_version])
+        else:
+            latest_version = latest_context_version
+        latest_context_checkpoint_file_name = 'checkpoint-context-Step-{}-verified.pt'.format(latest_version)
+        latest_model_checkpoint_file_name = 'checkpoint-model-Step-{}-verified.pt'.format(latest_version)
+        latest_context_checkpoint_file_path = osp.join(path, latest_context_checkpoint_file_name)
+        latest_model_checkpoint_file_path = osp.join(path, latest_model_checkpoint_file_name)
+
+        # Load the latest checkpoint
+        context_checkpoint = torch.load(latest_context_checkpoint_file_path)
+        model_checkpoint = torch.load(latest_model_checkpoint_file_path, map_location='cuda:0')
+
+        # Restore experiment context
+        self.logger.epoch_dict = context_checkpoint['logger_epoch_dict']
+        self.replay_buffer = context_checkpoint['replay_buffer']
+        self.start_time = context_checkpoint['start_time']
+        self.past_t = context_checkpoint['t'] + 1  # Crucial add 1 step to t to avoid repeating.
+
+        # Restore model
+        self.ac.load_state_dict(model_checkpoint['ac_state_dict'])
+        self.ac_targ.load_state_dict(model_checkpoint['target_ac_state_dict'])
+        self.pi_optimizer.load_state_dict(model_checkpoint['pi_optimizer_state_dict'])
+        self.q_optimizer.load_state_dict(model_checkpoint['q_optimizer_state_dict'])
+
 
         # Prepare for interaction with environment
     def train(self):
@@ -438,37 +478,10 @@ class RNN_TD3:
         if self.resume_exp_dir is not None:
             # Find the latest checkpoint
             resume_checkpoint_path = osp.join(self.resume_exp_dir, "pyt_save")
-            checkpoint_files = os.listdir(resume_checkpoint_path)
-            latest_context_version = np.max([int(f_name.split('-')[3]) for f_name in checkpoint_files if
-                                             'context' in f_name and 'verified' in f_name])
-            latest_model_version = np.max([int(f_name.split('-')[3]) for f_name in checkpoint_files if
-                                           'model' in f_name and 'verified' in f_name])
-            if latest_context_version != latest_model_version:
-                latest_version = np.min([latest_context_version, latest_model_version])
-            else:
-                latest_version = latest_context_version
-            latest_context_checkpoint_file_name = 'checkpoint-context-Step-{}-verified.pt'.format(latest_version)
-            latest_model_checkpoint_file_name = 'checkpoint-model-Step-{}-verified.pt'.format(latest_version)
-            latest_context_checkpoint_file_path = osp.join(resume_checkpoint_path, latest_context_checkpoint_file_name)
-            latest_model_checkpoint_file_path = osp.join(resume_checkpoint_path, latest_model_checkpoint_file_name)
-
-            # Load the latest checkpoint
-            context_checkpoint = torch.load(latest_context_checkpoint_file_path)
-            model_checkpoint = torch.load(latest_model_checkpoint_file_path)
-
-            # Restore experiment context
-            self.logger.epoch_dict = context_checkpoint['logger_epoch_dict']
-            self.replay_buffer = context_checkpoint['replay_buffer']
-            self.start_time = context_checkpoint['start_time']
-            self.past_t = context_checkpoint['t'] + 1  # Crucial add 1 step to t to avoid repeating.
-
-            # Restore model
-            self.ac.load_state_dict(model_checkpoint['ac_state_dict'])
-            self.ac_targ.load_state_dict(model_checkpoint['target_ac_state_dict'])
-            self.pi_optimizer.load_state_dict(model_checkpoint['pi_optimizer_state_dict'])
-            self.q_optimizer.load_state_dict(model_checkpoint['q_optimizer_state_dict'])
+            self.load(resume_checkpoint_path)
 
         print("past_t={}".format(past_t))
+        self.test_agent(0)
         # Main loop: collect experience in env and update/log each epoch
         for t in range(past_t, total_steps):  # Start from the step after resuming.
             # Until start_steps have elapsed, randomly sample actions
@@ -572,22 +585,22 @@ class RNN_TD3:
             if (t + 1) % self.steps_per_epoch == 0:
                 epoch = (t + 1) // self.steps_per_epoch
                 # Test the performance of the deterministic version of the agent.
-                self.test_agent()
+                self.test_agent(t + 1)
 
                 # Log info about epoch
-                self.logger.log_tabular('scalars/Epoch', epoch, timestep=epoch)
-                self.logger.log_tabular('scalars/EpRet', with_min_and_max=True, timestep=epoch)
-                self.logger.log_tabular('scalars/TestEpRet', with_min_and_max=True, timestep=epoch)
-                self.logger.log_tabular('scalars/EpLen', average_only=True, timestep=epoch)
-                self.logger.log_tabular('scalars/TestEpLen', average_only=True, timestep=epoch)
-                self.logger.log_tabular('scalars/TotalEnvInteracts', t, timestep=epoch)
-                self.logger.log_tabular('scalars/Q1Vals', with_min_and_max=True, timestep=epoch)
-                self.logger.log_tabular('scalars/Q2Vals', with_min_and_max=True, timestep=epoch)
-                self.logger.log_tabular('scalars/Q1ExtractedMemory', with_min_and_max=True, timestep=epoch)
-                self.logger.log_tabular('scalars/Q2ExtractedMemory', with_min_and_max=True, timestep=epoch)
-                self.logger.log_tabular('scalars/ActExtractedMemory', with_min_and_max=True, timestep=epoch)
-                self.logger.log_tabular('scalars/LossPi', average_only=True, timestep=epoch)
-                self.logger.log_tabular('scalars/LossQ', average_only=True, timestep=epoch)
+                self.logger.log_tabular('Epoch', epoch)
+                self.logger.log_tabular('EpRet', with_min_and_max=True)
+                self.logger.log_tabular('TestEpRet', with_min_and_max=True)
+                self.logger.log_tabular('EpLen', average_only=True)
+                self.logger.log_tabular('TestEpLen', average_only=True)
+                self.logger.log_tabular('TotalEnvInteracts', t)
+                self.logger.log_tabular('Q1Vals', with_min_and_max=True)
+                self.logger.log_tabular('Q2Vals', with_min_and_max=True)
+                self.logger.log_tabular('Q1ExtractedMemory', with_min_and_max=True)
+                self.logger.log_tabular('Q2ExtractedMemory', with_min_and_max=True)
+                self.logger.log_tabular('ActExtractedMemory', with_min_and_max=True)
+                self.logger.log_tabular('LossPi', average_only=True)
+                self.logger.log_tabular('LossQ', average_only=True)
 
-                self.logger.log_tabular('scalars/Time', time.time() - start_time, timestep=epoch)
+                self.logger.log_tabular('Time', time.time() - start_time)
                 self.logger.dump_tabular()

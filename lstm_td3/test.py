@@ -1,38 +1,15 @@
+# testing saved model
 import os
-from enum import Enum
+import re
 
 import torch
 
 from lstm_td3.rnn_td3 import RNN_TD3
-from lstm_td3.utils.logx import setup_logger_kwargs, colorize
-import os.path as osp
-import json
-from collections import namedtuple
-
+from lstm_td3.utils.logx import setup_logger_kwargs
 from lstm_td3.utils.tools import str2bool
 
-os.environ['MUJOCO_GL'] = 'egl'
-os.environ['LAZY_LEGACY_OP'] = '0'
-os.environ['TORCHDYNAMO_INLINE_INBUILT_NN_MODULES'] = "1"
-os.environ['TORCH_LOGS'] = "+recompiles"
-import warnings
-warnings.filterwarnings('ignore')
-torch.backends.cudnn.benchmark = True
-torch.set_float32_matmul_precision('high')
-
-
-
-#######################################################################################
-
-#######################################################################################
-
-
-#######################################################################################
-
-#######################################################################################
-
-
-if __name__ == '__main__':
+if __name__ == "__main__":
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--resume_exp_dir', type=str, default=None, help="The directory of the resuming experiment.")
@@ -73,42 +50,8 @@ if __name__ == '__main__':
     parser.add_argument("--compile", type=str2bool, default=False)
     args = parser.parse_args()
 
-    # Interpret without current feature extraction.
-    if args.critic_cur_feature_hid_sizes is None:
-        args.critic_cur_feature_hid_sizes = []
-    if args.actor_cur_feature_hid_sizes is None:
-        args.actor_cur_feature_hid_sizes = []
-
-
-    # Set log data saving directory
-    if args.resume_exp_dir is None:
-        # data_dir = osp.join(
-        #     osp.dirname(osp.dirname(osp.dirname(osp.dirname(osp.dirname(osp.dirname(osp.abspath(__file__))))))),
-        #     args.data_dir)
-        # data_dir = osp.join(
-        #         osp.dirname('/scratch/lingheng/'),
-        #         args.data_dir)
-        data_dir = osp.join(
-            osp.dirname('logdir/'),
-            args.data_dir)
-        logger_kwargs = setup_logger_kwargs(args.exp_name, args.seed, data_dir, datestamp=False)
-    else:
-        # Load config_json
-        resume_exp_dir = args.resume_exp_dir
-        config_path = osp.join(args.resume_exp_dir, 'config.json')
-        with open(osp.join(args.resume_exp_dir, "config.json"), 'r') as config_file:
-            config_json = json.load(config_file)
-        # Update resume_exp_dir value as default is None.
-        config_json['resume_exp_dir'] = resume_exp_dir
-        # Print config_json
-        output = json.dumps(config_json, separators=(',', ':\t'), indent=4, sort_keys=True)
-        print(colorize('Loading config:\n', color='cyan', bold=True))
-        print(output)
-        # Restore the hyper-parameters
-        logger_kwargs = config_json["logger_kwargs"]   # Restore logger_kwargs
-        config_json.pop('logger', None)                # Remove logger from config_json
-        args = json.loads(json.dumps(config_json), object_hook=lambda d: namedtuple('args', d.keys())(*d.values()))
-
+    logger_kwargs = setup_logger_kwargs(args.exp_name, data_dir=args.data_dir, datestamp=False)
+    model_path = os.path.join('logdir', logger_kwargs['output_dir'], 'pyt_save')
 
     algo = RNN_TD3(resume_exp_dir=args.resume_exp_dir,
                    env_name=args.env_name,
@@ -137,4 +80,7 @@ if __name__ == '__main__':
                    compile=args.compile,
                    logger_kwargs=logger_kwargs)
 
-    algo.train()
+    algo.load(model_path)
+    algo.test_agent(0, inference=True)
+
+

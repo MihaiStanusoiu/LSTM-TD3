@@ -120,6 +120,35 @@ class MLPCritic(nn.Module):
         return torch.squeeze(x, -1), extracted_memory
 
 
+class NCPActor(nn.Module):
+    def __init__(self, units, obs_dim, act_dim, act_limit, mem_pre_lstm_hid_sizes=(128,)):
+        super(NCPActor, self).__init__()
+        self.obs_dim = obs_dim
+        self.act_dim = act_dim
+        self.act_limit = act_limit
+        self.mem_pre_lstm_layers = nn.ModuleList()
+        mem_pre_lstm_layer_size = [obs_dim] + list(mem_pre_lstm_hid_sizes)
+        for h in range(len(mem_pre_lstm_layer_size) - 1):
+            self.mem_pre_lstm_layers += [nn.Linear(mem_pre_lstm_layer_size[h],
+                                                   mem_pre_lstm_layer_size[h + 1]),
+                                         nn.ReLU()]
+        input_size = obs_dim
+        wiring = ncps.wirings.AutoNCP(units, act_dim)
+        self.rnn = LTC(input_size, wiring, batch_first=True, return_sequences=False)
+
+    def forward(self, obs, hist_obs, hist_act, hist_seg_len):
+        h = None
+        with torch.no_grad():
+            x = hist_obs
+            for layer in self.mem_pre_lstm_layers:
+                x = layer(x)
+            _, h = self.rnn(x, h)
+        x = obs
+        for layer in self.mem_pre_lstm_layers:
+            x = layer(x)
+        a, h = self.rnn(x, h)
+        return self.act_limit * a, h
+
 class MLPActor(nn.Module):
     def __init__(self, obs_dim, act_dim, act_limit, rnn_cell_type: SequenceCellType,
                  mem_pre_lstm_hid_sizes=(128,),
@@ -210,7 +239,19 @@ class MLPActor(nn.Module):
                                           nn.ReLU()]
         self.post_combined_layers += [nn.Linear(post_combined_layer_size[-2], post_combined_layer_size[-1]), nn.Tanh()]
 
-    def forward(self, obs, hist_obs, hist_act, hist_seg_len):
+    @property
+    def forward(self):
+        _forward_val = getattr(self, "_forward_val", None)
+        if _forward_val is not None:
+            return _forward_val
+        if self.compile:
+            forward = torch.compile(self._forward, mode="reduce-overhead")
+        else:
+            forward = self._forward
+        self._forward_val = forward
+        return self._forward_val
+
+    def _forward(self, obs, hist_obs, hist_act, hist_seg_len):
         #
         tmp_hist_seg_len = deepcopy(hist_seg_len)
         tmp_hist_seg_len[hist_seg_len == 0] = 1
@@ -293,6 +334,8 @@ class MLPActorCritic(nn.Module):
                            cur_feature_hid_sizes=actor_cur_feature_hid_sizes,
                            post_comb_hid_sizes=actor_post_comb_hid_sizes,
                            hist_with_past_act=actor_hist_with_past_act)
+        if rnn_cell_type == SequenceCellType.LTC.value:
+            self.pi = NCPActor(actor_mem_lstm_hid_sizes[0], obs_dim, act_dim, act_limit)
 
     def act(self, obs, hist_obs=None, hist_act=None, hist_seg_len=None, device=None):
         if (hist_obs is None) or (hist_act is None) or (hist_seg_len is None):
@@ -300,5 +343,6 @@ class MLPActorCritic(nn.Module):
             hist_act = torch.zeros(1, 1, self.act_dim).to(device)
             hist_seg_len = torch.zeros(1).to(device)
         with torch.no_grad():
-            act, _, = self.pi(obs, hist_obs, hist_act, hist_seg_len)
+            torch.compiler.cudagraph_mark_step_begin()
+            act, h, = self.pi(obs, hist_obs, hist_act, hist_seg_len)
             return act.cpu().numpy()

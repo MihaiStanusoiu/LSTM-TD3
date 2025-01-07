@@ -1,5 +1,6 @@
 import argparse
 from enum import Enum
+import os
 
 import numpy as np
 
@@ -27,7 +28,6 @@ def statistics_scalar(x, with_min_and_max=False):
         return mean, std, global_min, global_max
     return mean, std
 
-
 def str2bool(v):
     """Function used in argument parser for converting string to bool."""
     if isinstance(v, bool):
@@ -48,3 +48,11 @@ class SequenceCellType(Enum):
     LSTM="lstm"
     LTC="ltc"
     CFC="cfc"
+
+def make_dir(dir_path):
+	"""Create directory if it does not already exist."""
+	try:
+		os.makedirs(dir_path)
+	except OSError:
+		pass
+	return dir_path

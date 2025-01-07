@@ -14,9 +14,11 @@ import pandas as pd
 import torch
 import os.path as osp, time, atexit, os
 import warnings
+import wandb
 
 from torch.utils.tensorboard import SummaryWriter
 
+from lstm_td3.utils.recorder import VideoRecorder
 from lstm_td3.utils.tools import statistics_scalar
 from lstm_td3.utils.serialization_utils import convert_json
 from lstm_td3.user_config import DEFAULT_DATA_DIR, FORCE_DATESTAMP
@@ -426,9 +428,22 @@ class EpochLogger(Logger):
     to record the desired values.
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, seed=1, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.epoch_dict = dict()
+        wandb.login(key="0b961bb8b95bbca48519a84eeca715dc4187268f")
+        wandb.init(
+            project="LTC-TD3",
+            entity="mihaistanusoiu-tu-wien",
+            name=str(seed),
+            dir=self.output_dir
+        )
+        self._wandb = wandb
+        self._recorder = VideoRecorder(self.output_dir, self._wandb)
+
+    @property
+    def video(self):
+        return self._recorder
 
     def store(self, **kwargs):
         """
@@ -441,6 +456,7 @@ class EpochLogger(Logger):
             if not(k in self.epoch_dict.keys()):
                 self.epoch_dict[k] = []
             self.epoch_dict[k].append(v)
+            self._wandb.log({k: v})
 
     def log_tabular(self, key, val=None, with_min_and_max=False, average_only=False):
         """
@@ -463,16 +479,22 @@ class EpochLogger(Logger):
         """
         if val is not None:
             super().log_tabular(key,val)
+            self._wandb.log({key: val})
         else:
             v = self.epoch_dict[key]
             vals = np.concatenate(v) if isinstance(v[0], np.ndarray) and len(v[0].shape)>0 else v
             stats = statistics_scalar(vals, with_min_and_max=with_min_and_max)
             super().log_tabular(key if average_only else 'Average' + key, stats[0])
+            self._wandb.log({key if average_only else 'Average' + key: stats[0]})
             if not(average_only):
                 super().log_tabular('Std'+key, stats[1])
+                self._wandb.log({'Std'+key: stats[1]})
             if with_min_and_max:
                 super().log_tabular('Max'+key, stats[3])
                 super().log_tabular('Min'+key, stats[2])
+                self._wandb.log({'Max'+key: stats[3]})
+                self._wandb.log({'Min'+key: stats[2]})
+
         self.epoch_dict[key] = []
 
     def get_stats(self, key):
